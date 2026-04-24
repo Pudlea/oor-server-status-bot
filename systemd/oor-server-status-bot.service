@@ -1,0 +1,19 @@
+[Unit]
+Description=OOR Server Status Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pudlea
+Group=pudlea
+WorkingDirectory=/home/pudlea/OOR-Server-Status-Bot
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

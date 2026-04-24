@@ -1,0 +1,7 @@
+Downloads/
+Uploads/
+node_modules/
+data/
+.env
+.DS_Store
+Thumbs.db
