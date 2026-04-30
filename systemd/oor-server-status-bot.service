@@ -8,11 +8,11 @@ Type=simple
 User=pudlea
 Group=pudlea
 WorkingDirectory=/home/pudlea/OOR-Server-Status-Bot
-ExecStart=/usr/bin/node src/index.js
+ExecStart=/usr/bin/node --max-old-space-size=512 src/index.js
 Restart=always
 RestartSec=5
 KillMode=control-group
-TimeoutStopSec=30
+TimeoutStopSec=15
 Environment=NODE_ENV=production
 
 [Install]

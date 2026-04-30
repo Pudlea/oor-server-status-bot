@@ -5,12 +5,14 @@
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
     "@discordjs/rest": "^2.6.0",
     "discord-api-types": "^0.38.31",
     "discord.js": "^14.18.0",
-    "dotenv": "^16.4.7"
+    "dotenv": "^16.4.7",
+    "playwright": "^1.49.1"
   }
 }
