@@ -2,7 +2,6 @@ require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
-const { chromium } = require('playwright');
 const {
   Client,
   GatewayIntentBits,
@@ -31,7 +30,6 @@ const OFFLINE_HELP_URL = process.env.OFFLINE_HELP_URL || 'https://oor-offline-he
 const ACC_LOBBY_STATUS_URL = process.env.ACC_LOBBY_STATUS_URL || 'https://acc-status.jonatan.net/';
 const LAST_GOOD_CACHE_PATH = path.join(ROOT, 'data', 'last-good-scrape.json');
 const LAST_CHECKED_HEARTBEAT_SECONDS = Number(process.env.LAST_CHECKED_HEARTBEAT_SECONDS || 300);
-const BROWSER_RECYCLE_MINUTES = Number(process.env.BROWSER_RECYCLE_MINUTES || 120);
 function normaliseDiscordEmoji(raw, fallbackName = 'ooricon') {
   const value = String(raw || '').trim();
   if (!value) return '🏁';
@@ -237,266 +235,205 @@ function truncate(str, max) {
   return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
 }
 
-let browserPromise = null;
-let browserStartedAt = 0;
-let scrapeInFlight = false;
 
-async function resetBrowser(reason = 'manual reset') {
-  const oldBrowserPromise = browserPromise;
-  browserPromise = null;
-  browserStartedAt = 0;
-  const oldBrowser = await oldBrowserPromise?.catch(() => null);
-  await oldBrowser?.close().catch(() => {});
-  debugLog('browser reset', reason);
+function httpTimeoutMs(value, fallback) {
+  const n = Number(value || fallback);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-async function getBrowser() {
-  const now = Date.now();
-  const recycleMs = BROWSER_RECYCLE_MINUTES > 0 ? BROWSER_RECYCLE_MINUTES * 60 * 1000 : 0;
-  if (browserPromise && recycleMs && browserStartedAt && now - browserStartedAt > recycleMs) {
-    await resetBrowser(`recycle after ${BROWSER_RECYCLE_MINUTES} minutes`);
-  }
-  if (!browserPromise) {
-    browserStartedAt = now;
-    browserPromise = chromium.launch({ headless: true, args: ['--disable-dev-shm-usage', '--no-sandbox'] });
-  }
-  const browser = await browserPromise;
-  if (!browser.isConnected()) {
-    await resetBrowser('browser disconnected');
-    browserStartedAt = Date.now();
-    browserPromise = chromium.launch({ headless: true, args: ['--disable-dev-shm-usage', '--no-sandbox'] });
-    return browserPromise;
-  }
-  return browser;
-}
-
-async function checkAccLobbyStatus(page) {
+async function fetchText(url, timeoutMs, label = 'fetch') {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    await page.goto(ACC_LOBBY_STATUS_URL, { waitUntil: 'domcontentloaded', timeout: 12000 });
-    await page.waitForTimeout(700);
-    const text = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
-    const compact = String(text || '').replace(/\s+/g, ' ').toLowerCase();
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'user-agent': 'OOR-Server-Status-Bot/1.0 (+https://covaxracing.org)',
+        accept: 'text/html,application/json;q=0.9,*/*;q=0.8',
+      },
+    });
+    if (!res.ok) throw new Error(`${label} returned HTTP ${res.status}`);
+    return await res.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
-    // The ACC status homepage includes generic explanatory words like "down" in help text,
-    // so avoid broad keyword matching. Prefer the explicit status card wording.
-    if (/servers\s+are\s+up/.test(compact)) return true;
-    if (/servers\s+are\s+down|server\s+browser\s+is\s+down|service\s+is\s+down/.test(compact)) return false;
+async function fetchJson(url, timeoutMs, label = 'fetchJson') {
+  const text = await fetchText(url, timeoutMs, label);
+  try { return JSON.parse(text); }
+  catch (err) { throw new Error(`${label} did not return JSON: ${err.message || err}`); }
+}
 
-    const statusCards = await page.locator('text=/Servers are (up|down)/i').allInnerTexts().catch(() => []);
-    const statusText = statusCards.join(' ').replace(/\s+/g, ' ').toLowerCase();
-    if (/servers\s+are\s+up/.test(statusText)) return true;
-    if (/servers\s+are\s+down/.test(statusText)) return false;
+function htmlToLines(html) {
+  return String(html || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '\n')
+    .replace(/<style[\s\S]*?<\/style>/gi, '\n')
+    .replace(/<br\s*\/?\s*>/gi, '\n')
+    .replace(/<\/(p|div|section|article|li|tr|td|th|h[1-6]|button|span)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#x27;/g, "'")
+    .replace(/&quot;/g, '"')
+    .split(/\n+/)
+    .map(line => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
 
+function buildServerListUrls() {
+  const base = new URL(ACC_STATUS_URL);
+  const variants = [];
+  const add = (params = {}) => {
+    const u = new URL(base.toString());
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && String(v) !== '') u.searchParams.set(k, String(v));
+    }
+    const txt = u.toString();
+    if (!variants.includes(txt)) variants.push(txt);
+  };
+
+  add({ search: SEARCH_TERM, visibility: VISIBILITY });
+  add({ q: SEARCH_TERM, visibility: VISIBILITY });
+  add({ search: SEARCH_TERM, private: VISIBILITY === 'private' ? 'true' : undefined });
+  add({ query: SEARCH_TERM, private: VISIBILITY === 'private' ? 'true' : undefined });
+  add();
+  return variants;
+}
+
+function looksLikeTrack(line) {
+  return /^(Barcelona|Brands Hatch|Circuit|Donington|Hungaroring|Imola|Indianapolis|Kyalami|Laguna Seca|Misano|Monza|Mount Panorama|Nürburgring|Nurburgring|Oulton Park|Paul Ricard|Red Bull Ring|Silverstone|Snetterton|Spa|Suzuka|Valencia|Watkins Glen|Zandvoort|Zolder|Autodromo)/i.test(String(line || ''));
+}
+
+function parseServersFromHtml(html) {
+  const lines = htmlToLines(html);
+  const search = SEARCH_TERM.toUpperCase();
+  const servers = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!String(line).toUpperCase().includes(search)) continue;
+
+    let track = 'Unknown track';
+    let carClass = 'Mixed';
+
+    for (let j = i - 1; j >= Math.max(0, i - 6); j -= 1) {
+      if (/^(Mixed|GT3|GT4|GT2|TCX|GTC)$/i.test(lines[j])) { carClass = lines[j].toUpperCase(); break; }
+    }
+    for (let j = i - 1; j >= Math.max(0, i - 8); j -= 1) {
+      if (looksLikeTrack(lines[j])) { track = lines[j]; break; }
+    }
+
+    const window = lines.slice(i + 1, i + 16);
+    const joined = window.join(' ');
+    const driverMatch = joined.match(/(\d+)\s*\/\s*(\d+)/);
+    if (!driverMatch) continue;
+
+    const sessions = [];
+    for (let k = 0; k < window.length; k += 1) {
+      const combined = `${window[k]} ${window[k + 1] || ''}`;
+      const m = combined.match(/\b([PQR])\s+(\d+)\s*min\b/i);
+      if (m) {
+        const session = `${m[1].toUpperCase()} ${m[2]}`;
+        if (!sessions.includes(session)) sessions.push(session);
+      }
+    }
+
+    const variabilityMatch = joined.match(/(\d+)%/);
+    const ipMatch = joined.match(/\bIP\s+((?:\d{1,3}\.){3}\d{1,3})\b/i);
+    const tcpMatch = joined.match(/\bTCP\s+(\d+)\b/i);
+    const udpMatch = joined.match(/\bUDP\s+(\d+)\b/i);
+
+    servers.push({
+      track,
+      name: line,
+      carClass,
+      drivers: Number(driverMatch[1]),
+      maxDrivers: Number(driverMatch[2]),
+      variability: variabilityMatch ? Number(variabilityMatch[1]) : 0,
+      sessions,
+      ip: ipMatch ? ipMatch[1] : null,
+      tcpPort: tcpMatch ? Number(tcpMatch[1]) : null,
+      udpPort: udpMatch ? Number(udpMatch[1]) : null,
+    });
+  }
+
+  return normaliseScrapedServers(servers);
+}
+
+function enrichFromLastGood(servers) {
+  const cached = loadLastGoodScrape()?.servers || loadConfig()?.global?.lastGoodScrape?.servers || [];
+  if (!Array.isArray(cached) || !cached.length) return servers;
+  const byName = new Map(cached.map(srv => [String(srv.name || '').trim().toUpperCase(), srv]));
+  return servers.map(server => {
+    const cachedServer = byName.get(String(server.name || '').trim().toUpperCase());
+    if (!cachedServer) return server;
+    return {
+      ...server,
+      ip: server.ip || cachedServer.ip || null,
+      tcpPort: server.tcpPort || cachedServer.tcpPort || null,
+      udpPort: server.udpPort || cachedServer.udpPort || null,
+      sessions: server.sessions?.length ? server.sessions : cachedServer.sessions || [],
+    };
+  });
+}
+
+async function checkAccLobbyStatus() {
+  try {
+    const apiUrl = new URL('/api/v2/acc/status', ACC_LOBBY_STATUS_URL).toString();
+    const data = await fetchJson(apiUrl, httpTimeoutMs(CONNECT_SCRAPE_TIMEOUT_MS, 1200), 'ACC status API');
+    if (Number(data?.status) === 1) return true;
+    if (Number(data?.status) === 0) return false;
     return null;
   } catch (err) {
-    debugLog('acc lobby status check skipped', err.message || err);
+    debugLog('acc status API check skipped', err.message || err);
     return null;
   }
-}
-
-async function enrichTcpPorts(page, servers) {
-  if (!ENABLE_CONNECT_LINKS || !Array.isArray(servers) || !servers.length) return servers;
-
-  const enriched = [];
-
-  for (const server of servers) {
-    const next = { ...server };
-
-    if (Number(next.tcpPort || 0) > 0) {
-      enriched.push(next);
-      continue;
-    }
-
-    const label = String(server.name || '').trim();
-    if (!label) {
-      enriched.push(next);
-      continue;
-    }
-
-    try {
-      debugLog('expand server for TCP', label);
-
-      const exactLocator = page.getByText(label, { exact: true }).first();
-      await exactLocator.click({ timeout: CONNECT_SCRAPE_TIMEOUT_MS }).catch(async () => {
-        const partial = label.slice(0, Math.min(60, label.length));
-        await page.locator(`text=${partial}`).first().click({ timeout: CONNECT_SCRAPE_TIMEOUT_MS });
-      });
-
-      await page.waitForTimeout(250);
-
-      const details = await page.evaluate(({ name, track }) => {
-        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-        const wantedName = clean(name);
-        const wantedTrack = clean(track);
-
-        const candidates = Array.from(document.querySelectorAll('body *'))
-          .map(el => clean(el.innerText || ''))
-          .filter(txt =>
-            txt.includes(wantedName) &&
-            txt.includes('TCP') &&
-            (!wantedTrack || txt.includes(wantedTrack)) &&
-            txt.length < 2200
-          )
-          .sort((a, b) => a.length - b.length);
-
-        const txt = candidates[0] || '';
-        const ipMatch = txt.match(/\bIP\s+((?:\d{1,3}\.){3}\d{1,3})\b/i);
-        const tcpMatch = txt.match(/\bTCP\s+(\d+)\b/i);
-        const udpMatch = txt.match(/\bUDP\s+(\d+)\b/i);
-
-        return {
-          ip: ipMatch ? ipMatch[1] : null,
-          tcpPort: tcpMatch ? Number(tcpMatch[1]) : null,
-          udpPort: udpMatch ? Number(udpMatch[1]) : null,
-        };
-      }, { name: server.name, track: server.track });
-
-      if (Number(details?.tcpPort || 0) > 0) {
-        next.ip = details.ip || next.ip || null;
-        next.tcpPort = Number(details.tcpPort);
-        next.udpPort = details.udpPort ? Number(details.udpPort) : next.udpPort || null;
-        debugLog('tcp found', label, next.tcpPort);
-      } else {
-        debugLog('tcp unavailable', label);
-      }
-    } catch (err) {
-      debugLog('tcp expansion skipped', label, err.message || err);
-    }
-
-    enriched.push(next);
-  }
-
-  return enriched;
 }
 
 async function scrapeServersCore() {
-  debugLog('scrape start');
-  const browser = await getBrowser();
-  debugLog('browser ready');
-  const context = await browser.newContext({ viewport: { width: 1280, height: 1600 } });
-  const page = await context.newPage();
+  debugLog('http scrape start');
+  const accOnline = await checkAccLobbyStatus();
+  const urls = buildServerListUrls();
+  let lastError = null;
 
-  try {
-    const accOnline = await checkAccLobbyStatus(page);
-
-    debugLog('goto', ACC_STATUS_URL);
-    await page.goto(ACC_STATUS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-    debugLog('fill search', SEARCH_TERM);
-    await page.locator('input').first().fill(SEARCH_TERM, { timeout: 10000 });
-
-    if (VISIBILITY === 'private') {
-      debugLog('click private filter');
-      await page.getByText(/^Private$/).first().click({ timeout: 8000 }).catch(err => debugLog('private click skipped', err.message));
-    }
-
-    debugLog('click search');
-    await page.getByRole('button', { name: /search/i }).first().click({ timeout: 8000 }).catch(err => debugLog('search click skipped', err.message));
-
-    await page.waitForTimeout(2500);
-    await page.waitForSelector('text=Found', { timeout: 12000 }).catch(err => debugLog('found selector skipped', err.message));
-
-    debugLog('extract visible server cards');
-    const data = await page.evaluate((searchTerm) => {
-      const parseCard = (fullText) => {
-        const text = (fullText || '').replace(/\s+/g, ' ').trim();
-        const lines = (fullText || '').split('\n').map(x => x.trim()).filter(Boolean);
-        const nameLine = lines.find(x => x.includes(searchTerm)) || '';
-        if (!nameLine) return null;
-
-        const trackLine = lines.find(x =>
-          !x.includes(searchTerm) &&
-          !/^Connect/i.test(x) &&
-          !/^(Mixed|GT3|GT4|GT2|TCX|GTC)$/i.test(x) &&
-          !/^IP\b/i.test(x) &&
-          !/^TCP\b/i.test(x) &&
-          !/^UDP\b/i.test(x) &&
-          !/^More servers/i.test(x) &&
-          !/^Found\s+/i.test(x) &&
-          !/^\d+\s*\/\s*\d+/.test(x)
-        ) || 'Unknown track';
-
-        const driverMatch = text.match(/(\d+)\s*\/\s*(\d+)/);
-        const variabilityMatch = text.match(/(\d+)%/);
-        const rawSessionMatches = [...text.matchAll(/\b([PQR])\s+(\d+)\s*min\b/gi)];
-        const sessionByType = new Map();
-        for (const m of rawSessionMatches) {
-          const type = m[1].toUpperCase();
-          if (!sessionByType.has(type)) sessionByType.set(type, type + ' ' + m[2]);
-        }
-        const sessionMatches = ['P', 'Q', 'R'].map(type => sessionByType.get(type)).filter(Boolean);
-        const classMatch = text.match(/\b(Mixed|GT3|GT4|GT2|TCX|GTC)\b/i);
-        const ipMatch = text.match(/\bIP\s+((?:\d{1,3}\.){3}\d{1,3})\b/i);
-        const tcpMatch = text.match(/\bTCP\s+(\d+)\b/i);
-        const udpMatch = text.match(/\bUDP\s+(\d+)\b/i);
-
-        return {
-          track: trackLine,
-          name: nameLine,
-          carClass: classMatch ? classMatch[1].toUpperCase() : 'Mixed',
-          drivers: driverMatch ? Number(driverMatch[1]) : 0,
-          maxDrivers: driverMatch ? Number(driverMatch[2]) : 0,
-          variability: variabilityMatch ? Number(variabilityMatch[1]) : 0,
-          sessions: sessionMatches,
-          ip: ipMatch ? ipMatch[1] : null,
-          tcpPort: tcpMatch ? Number(tcpMatch[1]) : null,
-          udpPort: udpMatch ? Number(udpMatch[1]) : null,
-        };
-      };
-
-      const candidates = Array.from(document.querySelectorAll('body *'))
-        .filter(el => {
-          const txt = el.innerText || '';
-          return txt.includes(searchTerm) && txt.length < 1600;
-        });
-
-      const unique = [];
-      const seen = new Set();
-
-      for (const card of candidates) {
-        const parsed = parseCard(card.innerText || '');
-        if (!parsed) continue;
-        const key = parsed.track + '|' + parsed.name + '|' + parsed.drivers + '/' + parsed.maxDrivers;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        unique.push(parsed);
+  for (const url of urls) {
+    try {
+      debugLog('fetch server list', url);
+      const html = await fetchText(url, httpTimeoutMs(SCRAPE_TIMEOUT_MS, 60000), 'server list');
+      const cleaned = normaliseScrapedServers(enrichFromLastGood(parseServersFromHtml(html)));
+      debugLog('http scrape parsed', cleaned.length, 'servers from', url, 'with tcp', cleaned.filter(s => s.tcpPort).length);
+      if (cleaned.length) {
+        return { ok: true, servers: cleaned, checkedAt: new Date().toISOString(), error: null, accOnline };
       }
+    } catch (err) {
+      lastError = err;
+      debugLog('server list fetch failed', url, err.message || err);
+    }
+  }
 
-      return unique;
-    }, SEARCH_TERM);
-
-    debugLog('visible cards found before cleanup', data.length);
-    const filtered = normaliseScrapedServers(data);
-    debugLog('visible cards after cleanup', filtered.length);
-    const enriched = await enrichTcpPorts(page, filtered);
-    const cleaned = normaliseScrapedServers(enriched);
-    debugLog('visible cards after tcp enrichment', cleaned.length, 'with tcp', cleaned.filter(s => s.tcpPort).length);
+  const cached = loadLastGoodScrape() || loadConfig()?.global?.lastGoodScrape || null;
+  if (cached?.servers?.length) {
+    debugLog('using cached last-good server list after empty HTTP scrape');
     return {
       ok: true,
-      servers: cleaned,
+      servers: cached.servers,
       checkedAt: new Date().toISOString(),
-      error: null,
+      error: 'Live HTTP scrape returned no OOR servers; reused last-good server list.',
       accOnline,
     };
-  } finally {
-    await context.close().catch(() => {});
   }
+
+  throw lastError || new Error('Live HTTP scrape returned no OOR servers and no last-good cache is available.');
 }
 
 async function scrapeServers() {
   try {
-    return await withTimeout(scrapeServersCore(), SCRAPE_TIMEOUT_MS, 'scrapeServers');
+    return await withTimeout(scrapeServersCore(), SCRAPE_TIMEOUT_MS + 2000, 'scrapeServers');
   } catch (err) {
-    if (/Target page|browser has been closed|context or browser|timed out/i.test(String(err?.message || err))) {
-      await resetBrowser('scrape failure');
-    }
-    return {
-      ok: false,
-      servers: [],
-      checkedAt: new Date().toISOString(),
-      error: err.message || String(err),
-      accOnline: null,
-    };
+    return { ok: false, servers: [], checkedAt: new Date().toISOString(), error: err.message || String(err), accOnline: null };
   }
 }
 
@@ -819,7 +756,7 @@ async function main() {
     console.log(`Search=${SEARCH_TERM} visibility=${VISIBILITY} refresh=${REFRESH_SECONDS}s`);
     console.log(`OOR icon emoji=${OOR_ICON_EMOJI}`);
     console.log(`Connect base=${CONNECT_BASE_URL}`);
-    console.log(`Connect links=${ENABLE_CONNECT_LINKS ? 'on' : 'off'} tcp timeout=${CONNECT_SCRAPE_TIMEOUT_MS}ms`);
+    console.log(`Connect links=${ENABLE_CONNECT_LINKS ? 'on' : 'off'} mode=http-cache-enriched`);
     console.log(`Scrape timeout=${SCRAPE_TIMEOUT_MS}ms debug=${DEBUG ? 'on' : 'off'}`);
     await refreshAll(client, { force: true, pruneDuplicates: true }).catch(console.error);
     startRefreshLoop();
@@ -952,8 +889,7 @@ async function main() {
           `Offline help: ${OFFLINE_HELP_URL}`,
           `Refresh: ${getRefreshSeconds(config)}s`,
           `ACC lobby status URL: ${ACC_LOBBY_STATUS_URL}`,
-          `Browser recycle: ${BROWSER_RECYCLE_MINUTES} min`,
-          `Last good cache: ${config.global.lastGoodScrape?.servers?.length || 0} server(s)`,
+              `Last good cache: ${config.global.lastGoodScrape?.servers?.length || 0} server(s)`,
           `Configured guilds: ${Object.keys(config.guilds).length}`,
         ].join('\n'),
       });
@@ -961,7 +897,6 @@ async function main() {
   });
 
   process.on('SIGINT', async () => {
-    await resetBrowser('shutdown');
     process.exit(0);
   });
 
