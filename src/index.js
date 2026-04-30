@@ -52,6 +52,7 @@ const ENABLE_CONNECT_LINKS = process.env.ENABLE_CONNECT_LINKS !== '0';
 const POST_PROTECTION_ENABLED = process.env.POST_PROTECTION_ENABLED !== '0';
 const USER_POST_DELETE_SECONDS = Math.max(1, Number(process.env.USER_POST_DELETE_SECONDS || 10));
 const USER_POST_NOTICE_SECONDS = Math.max(1, Number(process.env.USER_POST_NOTICE_SECONDS || 10));
+let scrapeInFlight = false;
 
 function debugLog(...args) {
   if (DEBUG) console.log('[Debug]', ...args);
