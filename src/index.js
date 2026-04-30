@@ -242,16 +242,27 @@ function httpTimeoutMs(value, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-async function fetchText(url, timeoutMs, label = 'fetch') {
+const HTTP_HEADERS = {
+  'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,text/plain;q=0.7,*/*;q=0.6',
+  'accept-language': 'en-GB,en;q=0.9,en-US;q=0.8',
+  'cache-control': 'no-cache',
+  pragma: 'no-cache',
+  connection: 'keep-alive',
+};
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchTextOnce(url, timeoutMs, label = 'fetch') {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       signal: controller.signal,
-      headers: {
-        'user-agent': 'OOR-Server-Status-Bot/1.0 (+https://covaxracing.org)',
-        accept: 'text/html,application/json;q=0.9,*/*;q=0.8',
-      },
+      headers: HTTP_HEADERS,
+      redirect: 'follow',
     });
     if (!res.ok) throw new Error(`${label} returned HTTP ${res.status}`);
     return await res.text();
@@ -260,8 +271,25 @@ async function fetchText(url, timeoutMs, label = 'fetch') {
   }
 }
 
+async function fetchText(url, timeoutMs, label = 'fetch', retries = 1) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const text = await fetchTextOnce(url, timeoutMs, label);
+      if (text && text.trim().length > 0) return text;
+      throw new Error(`${label} returned an empty response`);
+    } catch (err) {
+      lastError = err;
+      if (attempt >= retries) break;
+      debugLog(`${label} attempt ${attempt + 1} failed; retrying`, err.message || err);
+      await sleep(750);
+    }
+  }
+  throw lastError;
+}
+
 async function fetchJson(url, timeoutMs, label = 'fetchJson') {
-  const text = await fetchText(url, timeoutMs, label);
+  const text = await fetchText(url, timeoutMs, label, 1);
   try { return JSON.parse(text); }
   catch (err) { throw new Error(`${label} did not return JSON: ${err.message || err}`); }
 }
@@ -403,7 +431,7 @@ async function scrapeServersCore() {
   for (const url of urls) {
     try {
       debugLog('fetch server list', url);
-      const html = await fetchText(url, httpTimeoutMs(SCRAPE_TIMEOUT_MS, 60000), 'server list');
+      const html = await fetchText(url, httpTimeoutMs(SCRAPE_TIMEOUT_MS, 60000), 'server list', 1);
       const cleaned = normaliseScrapedServers(enrichFromLastGood(parseServersFromHtml(html)));
       debugLog('http scrape parsed', cleaned.length, 'servers from', url, 'with tcp', cleaned.filter(s => s.tcpPort).length);
       if (cleaned.length) {
