@@ -839,6 +839,24 @@ async function main() {
   await registerCommands();
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+// ------------------ heartbeat logging ------------------
+let heartbeatStarted = false;
+
+function startHeartbeat(clientRef, botName) {
+  if (heartbeatStarted) return;
+  heartbeatStarted = true;
+
+  setInterval(() => {
+    const mem = process.memoryUsage();
+    const rssMb = Math.round(mem.rss / 1024 / 1024);
+    const heapMb = Math.round(mem.heapUsed / 1024 / 1024);
+    const guilds = clientRef?.guilds?.cache?.size ?? "n/a";
+    const uptimeSec = Math.round(process.uptime());
+
+    console.log(`[Heartbeat] ${botName} alive | guilds=${guilds} rss=${rssMb}MB heap=${heapMb}MB uptime=${uptimeSec}s`);
+  }, 10 * 60 * 1000);
+}
+
   let refreshTimer = null;
 
   function startRefreshLoop() {
@@ -856,6 +874,7 @@ async function main() {
 
   client.once('clientReady', async () => {
     console.log(`Logged in as ${client.user.tag}`);
+    startHeartbeat(client, 'oor-server-status-bot');
     console.log(`Search=${SEARCH_TERM} visibility=${VISIBILITY} refresh=${REFRESH_SECONDS}s`);
     console.log(`OOR icon emoji=${OOR_ICON_EMOJI}`);
     console.log(`Connect base=${CONNECT_BASE_URL}`);
